@@ -1,19 +1,16 @@
-import csv
+import argparse
+import concurrent.futures
+import json
+import math
+import os
+import re
 import statistics
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
+from pathlib import Path
 
 import rpyc
 
-SERVER_HOST = "server"
-SERVER_PORT = 18861
-FILENAME = "sample.txt"
-
-RATES = [10, 60, 80, 100, 150]
-
-DURATION_SECONDS = 10
-MAX_WORKERS = 50
 
 KEYWORDS = [
     "elizabeth",
@@ -35,177 +32,149 @@ KEYWORDS = [
     "fortune",
     "society",
     "proposal",
-    "relationship"
+    "relationship",
 ]
 
-thread_local = threading.local()
+
+def parse_endpoint(endpoint):
+    host, separator, port = endpoint.rpartition(":")
+    if not separator or not host:
+        raise ValueError(f"expected HOST:PORT, received {endpoint!r}")
+    return host, int(port)
 
 
-def get_connection():
-    if not hasattr(thread_local, "conn"):
-        thread_local.conn = rpyc.connect(
-            SERVER_HOST,
-            SERVER_PORT
+def percentile(values, percentile_value):
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    index = max(0, math.ceil(percentile_value * len(ordered)) - 1)
+    return ordered[index]
+
+
+def send_request(endpoint, filename, keyword, expected_count, timeout):
+    started = time.perf_counter()
+    connection = None
+    try:
+        host, port = parse_endpoint(endpoint)
+        connection = rpyc.connect(
+            host,
+            port,
+            config={"sync_request_timeout": timeout},
         )
-    return thread_local.conn
-
-
-def close_connection():
-    if hasattr(thread_local, "conn"):
-        try:
-            thread_local.conn.close()
-        except Exception:
-            pass
-        del thread_local.conn
-
-
-def warmup_connection():
-    conn = get_connection()
-    conn.root.count_word("the", FILENAME)
-
-
-def send_request(index):
-    keyword = KEYWORDS[index % len(KEYWORDS)]
-
-    conn = get_connection()
-
-    start = time.perf_counter()
-
-    count, cache_hit, server_name = conn.root.count_word(
-        keyword,
-        FILENAME
-    )
-
-    end = time.perf_counter()
-
-    return {
-        "keyword": keyword,
-        "count": count,
-        "cache_hit": cache_hit,
-        "server": server_name,
-        "latency_ms": (end - start) * 1000
-    }
-
-
-def percentile(values, p):
-    values = sorted(values)
-
-    if not values:
-        return 0
-
-    index = (len(values) - 1) * p
-
-    lower = int(index)
-    upper = min(lower + 1, len(values))
-
-    weight = index - lower
-
-    return values[lower] + (values[upper] - values[lower]) * weight
-
-
-def run_experiment(rate):
-    total_requests = rate * DURATION_SECONDS
-
-    print()
-    print(f"Running {rate} requests/second")
-    print(f"Total requests: {total_requests}")
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        warmup_tasks = [
-            executor.submit(warmup_connection)
-            for _ in range(MAX_WORKERS)
-        ]
-
-        for task in warmup_tasks:
-            task.result()
-
-        futures = []
-
-        interval = 1.0 / rate
-        next_request = time.perf_counter()
-
-        for i in range(total_requests):
-            now = time.perf_counter()
-
-            if now < next_request:
-                time.sleep(next_request - now)
-
-            futures.append(
-                executor.submit(send_request, i)
-            )
-
-            next_request += interval
-
-        results = []
-
-        for future in futures:
-            try:
-                results.append(future.result())
-            except Exception as e:
-                print(f"Request failed: {e}")
-
-    latencies = [
-        result["latency_ms"]
-        for result in results
-    ]
-
-    average = statistics.mean(latencies)
-    p99 = percentile(latencies, 0.99)
-
-    cache_hits = sum(
-        1 for result in results
-        if result["cache_hit"]
-    )
-
-    print(f"Successful requests: {len(results)}")
-    print(f"Average latency: {average:.3f} ms")
-    print(f"P99 latency: {p99:.3f} ms")
-    print(f"Cache hits: {cache_hits}")
-
-    return {
-        "rate": rate,
-        "requests": len(results),
-        "average_latency_ms": average,
-        "p99_latency_ms": p99,
-        "cache_hits": cache_hits
-    }
+        count, cache_hit, server_name = connection.root.count_word(
+            keyword,
+            filename,
+        )
+        latency_ms = (time.perf_counter() - started) * 1000
+        if count != expected_count:
+            return {
+                "ok": False,
+                "latency_ms": latency_ms,
+                "keyword": keyword,
+                "error": (
+                    f"expected {expected_count} occurrences, received {count}"
+                ),
+            }
+        return {
+            "ok": True,
+            "latency_ms": latency_ms,
+            "keyword": keyword,
+            "server": server_name,
+            "cache_hit": bool(cache_hit),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "latency_ms": (time.perf_counter() - started) * 1000,
+            "keyword": keyword,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def main():
-    results = []
+    parser = argparse.ArgumentParser(
+        description="Benchmark concurrent, one-RPyC-connection-per-request calls."
+    )
+    parser.add_argument(
+        "--endpoint",
+        default=os.getenv("LOAD_BALANCER_ENDPOINT", "localhost:18860"),
+        help="HOST:PORT of the load balancer or one server",
+    )
+    parser.add_argument(
+        "--file",
+        default="/app/server/texts/pride-and-prejudice.txt",
+        help="same UTF-8 text file used by every server",
+    )
+    parser.add_argument("--requests", type=int, default=300)
+    parser.add_argument("--concurrency", type=int, default=30)
+    parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--output",
+        default="/app/results/benchmark-results.json",
+        help="JSON summary output path",
+    )
+    args = parser.parse_args()
 
-    for rate in RATES:
-        result = run_experiment(rate)
-        results.append(result)
+    if args.requests < 1 or args.concurrency < 1:
+        parser.error("--requests and --concurrency must be positive")
 
-        time.sleep(3)
+    file_path = Path(args.file)
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        parser.error(f"cannot read {file_path}: {exc}")
 
-    with open(
-        "/app/experiments/phase2_results.csv",
-        "w",
-        newline=""
-    ) as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=[
-                "rate",
-                "requests",
-                "average_latency_ms",
-                "p99_latency_ms",
-                "cache_hits"
-            ]
-        )
+    words = re.findall(r"\b[\w']+\b", text.lower())
+    word_counts = Counter(words)
+    filename = file_path.name
+    started = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=args.concurrency
+    ) as executor:
+        futures = [
+            executor.submit(
+                send_request,
+                args.endpoint,
+                filename,
+                KEYWORDS[index % len(KEYWORDS)],
+                word_counts[KEYWORDS[index % len(KEYWORDS)]],
+                args.timeout,
+            )
+            for index in range(args.requests)
+        ]
+        results = [future.result() for future in futures]
+    elapsed_seconds = time.perf_counter() - started
 
-        writer.writeheader()
-        writer.writerows(results)
+    successful = [result for result in results if result["ok"]]
+    latencies = [result["latency_ms"] for result in results]
+    servers = Counter(result["server"] for result in successful)
+    summary = {
+        "endpoint": args.endpoint,
+        "file": str(file_path),
+        "requests": args.requests,
+        "concurrency": args.concurrency,
+        "successful_requests": len(successful),
+        "failed_or_incorrect_requests": len(results) - len(successful),
+        "average_latency_ms": round(statistics.mean(latencies), 2),
+        "p99_latency_ms": round(percentile(latencies, 0.99), 2),
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "requests_per_second": round(args.requests / elapsed_seconds, 2),
+        "servers": dict(servers),
+        "cache_hits": sum(result["cache_hit"] for result in successful),
+        "cache_misses": sum(not result["cache_hit"] for result in successful),
+        "errors": [result["error"] for result in results if not result["ok"]][:10],
+    }
 
-    print()
-    print("Experiment complete")
-    print("Results saved to /app/experiments/phase2_results.csv")
-
-    for worker in range(MAX_WORKERS):
-        pass
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+    print(f"Full summary saved to {output_path}")
+    return 0 if summary["failed_or_incorrect_requests"] == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

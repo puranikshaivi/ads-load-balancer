@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import re
 import time
@@ -34,7 +36,30 @@ def count_word_in_text(keyword, filepath):
 
 class WordCountService(rpyc.Service):
 
+    def exposed_count_words(self, text, filename):
+        started = time.perf_counter()
+        text = str(text)
+        filename = Path(str(filename)).name
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        cache_key = f"wordcount:{filename}:{digest}"
+
+        cached = redis_client.get(cache_key)
+        cache_status = "HIT" if cached is not None else "MISS"
+        word_count = int(cached) if cached is not None else len(text.split())
+
+        if cached is None:
+            redis_client.set(cache_key, word_count)
+
+        response = {
+            "word_count": word_count,
+            "cache_status": cache_status,
+            "server": SERVER_NAME,
+            "server_processing_ms": round((time.perf_counter() - started) * 1000, 2),
+        }
+        return json.dumps(response)
+
     def exposed_count_word(self, keyword, filename):
+        started = time.perf_counter()
         keyword = str(keyword).strip().lower()
         filename = Path(str(filename)).name
 
@@ -54,7 +79,8 @@ class WordCountService(rpyc.Service):
             redis_client.incr(f"hot:{keyword}")
             print(
                 f"[{SERVER_NAME}] CACHE HIT | "
-                f"keyword={keyword} | file={filename} | count={cached}",
+                f"keyword={keyword} | file={filename} | count={cached} | "
+                f"processing_ms={(time.perf_counter() - started) * 1000:.2f}",
                 flush=True
             )
             return int(cached), True, SERVER_NAME
@@ -66,7 +92,8 @@ class WordCountService(rpyc.Service):
 
         print(
             f"[{SERVER_NAME}] CACHE MISS | "
-            f"keyword={keyword} | file={filename} | count={count}",
+            f"keyword={keyword} | file={filename} | count={count} | "
+            f"processing_ms={(time.perf_counter() - started) * 1000:.2f}",
             flush=True
         )
 

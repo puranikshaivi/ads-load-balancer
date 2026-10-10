@@ -5,23 +5,118 @@ services:
     container_name: ads-redis
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
-  server:
+  phase2-server:
+    profiles: ["phase2"]
     build: .
-    container_name: ads-server
     environment:
+      SERVER_NAME: phase2-server
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      SERVER_NAME: server
+    command: ["python", "/app/server/server.py"]
+    ports:
+      - "18864:18861"
     depends_on:
-      - redis
-    command: python /app/server/server.py
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import rpyc; c=rpyc.connect('127.0.0.1',18861,config={'sync_request_timeout':2}); c.root.count_word('the','pride-and-prejudice.txt'); c.close()"]
+      interval: 10s
+      timeout: 4s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  server1:
+    build: .
+    environment:
+      SERVER_NAME: server1
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    command: ["python", "/app/server/server.py"]
     ports:
       - "18861:18861"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import rpyc; c=rpyc.connect('127.0.0.1',18861,config={'sync_request_timeout':2}); c.root.count_word('the','pride-and-prejudice.txt'); c.close()"]
+      interval: 10s
+      timeout: 4s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  server2:
+    build: .
+    environment:
+      SERVER_NAME: server2
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    command: ["python", "/app/server/server.py"]
+    ports:
+      - "18862:18861"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import rpyc; c=rpyc.connect('127.0.0.1',18861,config={'sync_request_timeout':2}); c.root.count_word('the','pride-and-prejudice.txt'); c.close()"]
+      interval: 10s
+      timeout: 4s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  server3:
+    build: .
+    environment:
+      SERVER_NAME: server3
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    command: ["python", "/app/server/server.py"]
+    ports:
+      - "18863:18861"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import rpyc; c=rpyc.connect('127.0.0.1',18861,config={'sync_request_timeout':2}); c.root.count_word('the','pride-and-prejudice.txt'); c.close()"]
+      interval: 10s
+      timeout: 4s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  load-balancer:
+    build: .
+    command: ["python", "/app/load_balancer/proxy.py"]
+    environment:
+      LB_ALGORITHM: ${LB_ALGORITHM:-LEAST_CONNECTIONS}
+      LB_BACKENDS: server1:18861,server2:18861,server3:18861
+      LB_HOST: 0.0.0.0
+      LB_PORT: 18860
+      LB_RESPONSE_TIMEOUT: 60
+    ports:
+      - "18860:18860"
+    depends_on:
+      server1:
+        condition: service_healthy
+      server2:
+        condition: service_healthy
+      server3:
+        condition: service_healthy
+    restart: unless-stopped
 
   client:
     build: .
     container_name: ads-client
-    depends_on:
-      - server
+    volumes:
+      - ./results:/app/results
+    environment:
+      LOAD_BALANCER_ENDPOINT: load-balancer:18860
     command: sleep infinity

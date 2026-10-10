@@ -1,40 +1,55 @@
-import sys
+import argparse
+import os
 import time
 
 import rpyc
 
 
+def parse_endpoint(endpoint):
+    host, separator, port = endpoint.rpartition(":")
+    if not separator or not host:
+        raise ValueError(f"expected HOST:PORT, received {endpoint!r}")
+    return host, int(port)
+
+
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: python client.py <keyword> <filename>")
-        sys.exit(1)
-
-    keyword = sys.argv[1]
-    filename = sys.argv[2]
-
-    conn = rpyc.connect("server", 18861)
-
-    start = time.perf_counter()
-
-    count, cache_hit, server_name = conn.root.count_word(
-        keyword,
-        filename
+    parser = argparse.ArgumentParser(
+        description="Count occurrences of a word using the RPyC service."
     )
+    parser.add_argument("keyword", help="word to count")
+    parser.add_argument("filename", help="text filename on the server")
+    parser.add_argument(
+        "--server",
+        default=os.getenv("LOAD_BALANCER_ENDPOINT", "localhost:18860"),
+        help="HOST:PORT of the load balancer or a server",
+    )
+    parser.add_argument("--timeout", type=float, default=10.0)
+    args = parser.parse_args()
 
-    end = time.perf_counter()
+    host, port = parse_endpoint(args.server)
+    connection = rpyc.connect(
+        host,
+        port,
+        config={"sync_request_timeout": args.timeout},
+    )
+    try:
+        started = time.perf_counter()
+        count, cache_hit, server_name = connection.root.count_word(
+            args.keyword,
+            args.filename,
+        )
+        latency_ms = (time.perf_counter() - started) * 1000
+    finally:
+        connection.close()
 
-    latency_ms = (end - start) * 1000
-
-    print(f"Keyword: {keyword}")
-    print(f"File: {filename}")
+    print(f"Keyword: {args.keyword}")
+    print(f"File: {args.filename}")
     print(f"Count: {count}")
-    print(f"Cache hit: {cache_hit}")
+    print(f"Cache: {'HIT' if cache_hit else 'MISS'}")
     print(f"Server: {server_name}")
-    print(f"Latency: {latency_ms:.3f} ms")
-
-    conn.close()
+    print(f"Client latency: {latency_ms:.2f} ms")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-    
+    raise SystemExit(main())
