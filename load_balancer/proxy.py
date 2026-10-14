@@ -91,6 +91,34 @@ class BackendPool:
             backend.unavailable_until = (
                 time.monotonic() + self.failure_cooldown_seconds
             )
+            logger.warning(
+                "backend marked unavailable backend=%s cooldown=%.1fs", backend.name, self.failure_cooldown_seconds
+            )
+
+    async def mark_available(self, backend):
+        async with self.lock:
+            backend.unavailable_until = 0.0
+            logger.info("backend marked available backend=%s", backend.name)
+
+    async def health_check(self):
+        """Probe each backend with a short TCP connection to detect failures and recoveries."""
+        for backend in self.backends:
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(backend.host, backend.port),
+                    timeout=2,
+                )
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (ConnectionError, OSError):
+                    pass
+                await self.mark_available(backend)
+            except (OSError, asyncio.TimeoutError) as exc:
+                logger.warning(
+                    "health check failed backend=%s error=%s", backend.name, exc
+                )
+                await self.mark_unavailable(backend)
 
     async def record_response(self, backend, elapsed_ms):
         async with self.lock:
@@ -226,6 +254,14 @@ async def handle_client(client_reader, client_writer, pool, response_timeout):
             await pool.release(backend)
 
 
+async def health_check_loop(pool, interval):
+    """Periodically probe all backends to detect failures and recoveries."""
+    logger.info("health check loop started interval=%.1fs", interval)
+    while True:
+        await pool.health_check()
+        await asyncio.sleep(interval)
+
+
 async def main():
     algorithm = os.getenv("LB_ALGORITHM", "LEAST_CONNECTIONS")
     backends = parse_backends(
@@ -238,6 +274,7 @@ async def main():
     host = os.getenv("LB_HOST", "0.0.0.0")
     port = int(os.getenv("LB_PORT", "18860"))
     response_timeout = float(os.getenv("LB_RESPONSE_TIMEOUT", "60"))
+    health_check_interval = float(os.getenv("LB_HEALTH_CHECK_INTERVAL", "3"))
 
     logger.info(
         "starting TCP proxy algorithm=%s listen=%s:%s backends=%s",
@@ -253,8 +290,19 @@ async def main():
         host,
         port,
     )
-    async with server:
-        await server.serve_forever()
+
+    # Start the periodic health check background task
+    health_task = asyncio.create_task(health_check_loop(pool, health_check_interval))
+
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        health_task.cancel()
+        try:
+            await health_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
