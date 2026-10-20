@@ -1,8 +1,12 @@
 import asyncio
 import logging
 import os
+import struct
 import time
+import zlib
 from dataclasses import dataclass
+
+from rpyc.core import brine, consts
 
 
 logging.basicConfig(
@@ -10,7 +14,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger("rpyc-load-balancer")
-
 
 def parse_backends(value):
     backends = []
@@ -30,7 +33,7 @@ class Backend:
     port: int
     active: int = 0
     estimated_response_ms: float = 1.0
-    unavailable_until: float = 0.0
+    response_samples: int = 0
 
     @property
     def name(self):
@@ -44,39 +47,41 @@ class BackendPool:
             raise ValueError(
                 "LB_ALGORITHM must be LEAST_CONNECTIONS or LEAST_RESPONSE_TIME"
             )
+        if not backends:
+            raise ValueError("At least one backend is required")
+
         self.backends = backends
         self.algorithm = algorithm
         self.lock = asyncio.Lock()
         self.next_tie_break = 0
         self.ema_alpha = 0.2
-        self.failure_cooldown_seconds = 2.0
 
     async def select(self):
+        """Choose and reserve the least-loaded backend for the selected policy."""
         async with self.lock:
-            now = time.monotonic()
-            eligible = [
-                (index, backend)
-                for index, backend in enumerate(self.backends)
-                if backend.unavailable_until <= now
-            ]
-            if not eligible:
-                raise ConnectionError("All backends are temporarily unavailable")
-
             start = self.next_tie_break % len(self.backends)
 
-            def selection_key(item):
-                index, backend = item
+            def score(backend):
                 if self.algorithm == "LEAST_CONNECTIONS":
-                    load = backend.active
-                else:
-                    load = backend.estimated_response_ms * (backend.active + 1)
-                return load, (index - start) % len(self.backends)
+                    return backend.active
+                return backend.estimated_response_ms * (backend.active + 1)
 
-            _, selected = min(eligible, key=selection_key)
-            selected.active += 1
-            self.next_tie_break = (self.backends.index(selected) + 1) % len(
-                self.backends
+            scores = [score(backend) for backend in self.backends]
+            lowest_score = min(scores)
+            tied = [
+                index
+                for index, backend_score in enumerate(scores)
+                if backend_score == lowest_score
+            ]
+            selected_index = min(
+                tied,
+                key=lambda index: (index - start) % len(self.backends),
             )
+            selected = self.backends[selected_index]
+
+            selected.active += 1
+            self.next_tie_break = (selected_index + 1) % len(self.backends)
+
             logger.info(
                 "selected backend=%s algorithm=%s active=%s estimates_ms=%s",
                 selected.name,
@@ -86,28 +91,29 @@ class BackendPool:
             )
             return selected
 
-    async def mark_unavailable(self, backend):
-        async with self.lock:
-            backend.unavailable_until = (
-                time.monotonic() + self.failure_cooldown_seconds
-            )
-
     async def record_response(self, backend, elapsed_ms):
         async with self.lock:
             backend.estimated_response_ms += self.ema_alpha * (
                 elapsed_ms - backend.estimated_response_ms
             )
+            backend.response_samples += 1
             logger.info(
-                "response backend=%s algorithm=%s response_ms=%.2f estimate_ms=%.2f active=%s",
+                "response backend=%s algorithm=%s response_ms=%.2f "
+                "estimate_ms=%.2f samples=%s active=%s",
                 backend.name,
                 self.algorithm,
                 elapsed_ms,
                 backend.estimated_response_ms,
+                backend.response_samples,
                 self.active_counts(),
             )
 
     async def release(self, backend):
         async with self.lock:
+            if backend.active <= 0:
+                raise RuntimeError(
+                    f"Cannot release an unreserved backend: {backend.name}"
+                )
             backend.active -= 1
             logger.info(
                 "released backend=%s algorithm=%s active=%s",
@@ -126,86 +132,238 @@ class BackendPool:
         }
 
 
+class RPyCFrameParser:
+    """Observe complete RPyC frames without changing the forwarded stream."""
+
+    header = struct.Struct("!LB")
+    flusher = b"\n"
+
+    def __init__(self):
+        self._header = bytearray()
+        self._frame_bytes_remaining = None
+        self._compressed = False
+        self._payload = bytearray()
+
+    def feed(self, data):
+        frames = []
+        offset = 0
+        while offset < len(data):
+            if self._frame_bytes_remaining is None:
+                needed = self.header.size - len(self._header)
+                amount = min(needed, len(data) - offset)
+                self._header.extend(data[offset:offset + amount])
+                offset += amount
+                if len(self._header) == self.header.size:
+                    payload_length, compression_flag = self.header.unpack(
+                        self._header
+                    )
+                    self._header.clear()
+                    self._compressed = bool(compression_flag)
+                    self._frame_bytes_remaining = payload_length + len(
+                        self.flusher
+                    )
+                    self._payload.clear()
+            else:
+                amount = min(
+                    self._frame_bytes_remaining,
+                    len(data) - offset,
+                )
+                payload_bytes = data[offset:offset + amount]
+                payload_length_remaining = (
+                    self._frame_bytes_remaining - len(self.flusher)
+                )
+                payload_amount = min(amount, max(0, payload_length_remaining))
+                self._payload.extend(payload_bytes[:payload_amount])
+                self._frame_bytes_remaining -= amount
+                offset += amount
+
+                if self._frame_bytes_remaining == 0:
+                    terminator_valid = (
+                        bool(payload_bytes)
+                        and payload_bytes[-1:] == self.flusher
+                    )
+                    frames.append((
+                        self._compressed,
+                        bytes(self._payload),
+                        terminator_valid,
+                    ))
+                    self._frame_bytes_remaining = None
+                    self._payload.clear()
+        return frames
+
+
+class RPyCResponseTracker:
+    """Measure completed RPyC method calls by matching their sequence IDs."""
+
+    def __init__(self, pool, backend):
+        self.pool = pool
+        self.backend = backend
+        self.client_frames = RPyCFrameParser()
+        self.backend_frames = RPyCFrameParser()
+        self.pending_requests = {}
+
+    @staticmethod
+    def _decode_frame(frame):
+        compressed, payload, terminator_valid = frame
+        if not terminator_valid:
+            raise ValueError("Invalid RPyC frame terminator")
+        if compressed:
+            payload = zlib.decompress(payload)
+        message_type, = brine.I1.unpack(payload[:1])
+        sequence, arguments = brine.load(payload[1:])
+        return message_type, sequence, arguments
+
+    async def observe_client_data(self, data):
+        for frame in self.client_frames.feed(data):
+            try:
+                message_type, sequence, arguments = self._decode_frame(frame)
+            except (EOFError, IndexError, ValueError, struct.error, zlib.error) as exc:
+                logger.warning(
+                    "could not inspect client RPyC frame backend=%s error=%s",
+                    self.backend.name,
+                    exc,
+                )
+                continue
+
+            if message_type != consts.MSG_REQUEST:
+                continue
+            try:
+                handler, _ = arguments
+            except (TypeError, ValueError):
+                logger.warning(
+                    "could not inspect client RPyC request backend=%s",
+                    self.backend.name,
+                )
+                continue
+            if (
+                isinstance(sequence, int)
+                and handler in (consts.HANDLE_CALL, consts.HANDLE_CALLATTR)
+            ):
+                self.pending_requests[sequence] = time.perf_counter()
+
+    async def observe_backend_data(self, data):
+        for frame in self.backend_frames.feed(data):
+            try:
+                message_type, sequence, _ = self._decode_frame(frame)
+            except (EOFError, IndexError, ValueError, struct.error, zlib.error) as exc:
+                logger.warning(
+                    "could not inspect backend RPyC frame backend=%s error=%s",
+                    self.backend.name,
+                    exc,
+                )
+                continue
+
+            if message_type not in {consts.MSG_REPLY, consts.MSG_EXCEPTION}:
+                continue
+            if not isinstance(sequence, int):
+                logger.warning(
+                    "could not inspect backend RPyC sequence ID backend=%s",
+                    self.backend.name,
+                )
+                continue
+            started_at = self.pending_requests.pop(sequence, None)
+            if started_at is None:
+                continue
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            await self.pool.record_response(self.backend, elapsed_ms)
+
+
 async def copy_stream(reader, writer, on_data=None):
+    """Forward raw TCP bytes from one side of the proxy to the other."""
     while True:
         data = await reader.read(65536)
         if not data:
             break
         if on_data is not None:
-            await on_data()
+            await on_data(data)
         writer.write(data)
         await writer.drain()
+
     if writer.can_write_eof():
         writer.write_eof()
         await writer.drain()
 
 
+async def forward_bidirectional(
+    client_reader,
+    client_writer,
+    backend_reader,
+    backend_writer,
+    response_tracker,
+):
+    tasks = [
+        asyncio.create_task(copy_stream(
+            client_reader,
+            backend_writer,
+            response_tracker.observe_client_data,
+        )),
+        asyncio.create_task(copy_stream(
+            backend_reader,
+            client_writer,
+            response_tracker.observe_backend_data,
+        )),
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 async def close_writer(writer):
-    if writer is not None:
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except (ConnectionError, OSError):
-            pass
+    if writer is None:
+        return
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except (ConnectionError, OSError):
+        pass
 
 
 async def handle_client(client_reader, client_writer, pool, response_timeout):
     client = client_writer.get_extra_info("peername")
-    attempted = set()
     backend = None
     backend_writer = None
-    response_recorded = False
-    connected_at = None
+    response_tracker = None
+    reserved = False
 
     try:
-        while len(attempted) < len(pool.backends):
-            try:
-                backend = await pool.select()
-            except ConnectionError as exc:
-                logger.error("client=%s connection failed: %s", client, exc)
-                return
-
-            attempted.add(backend.name)
-            try:
-                backend_reader, backend_writer = await asyncio.wait_for(
-                    asyncio.open_connection(backend.host, backend.port),
-                    timeout=response_timeout,
-                )
-                connected_at = time.perf_counter()
-                break
-            except (OSError, asyncio.TimeoutError) as exc:
-                logger.error(
-                    "backend connection failed backend=%s client=%s error=%s",
-                    backend.name,
-                    client,
-                    exc,
-                )
-                await pool.mark_unavailable(backend)
-                await pool.release(backend)
-                backend = None
-        else:
+        backend = await pool.select()
+        reserved = True
+        try:
+            backend_reader, backend_writer = await asyncio.wait_for(
+                asyncio.open_connection(backend.host, backend.port),
+                timeout=response_timeout,
+            )
+        except (OSError, asyncio.TimeoutError) as exc:
             logger.error(
-                "client=%s connection failed: no reachable backend", client
+                "backend connection failed backend=%s client=%s error=%s",
+                backend.name,
+                client,
+                exc,
             )
             return
 
-        async def record_first_response():
-            nonlocal response_recorded
-            if response_recorded:
-                return
-            response_recorded = True
-            elapsed_ms = (time.perf_counter() - connected_at) * 1000
-            await pool.record_response(backend, elapsed_ms)
-
+        response_tracker = RPyCResponseTracker(pool, backend)
         await asyncio.wait_for(
-            asyncio.gather(
-                copy_stream(client_reader, backend_writer),
-                copy_stream(backend_reader, client_writer, record_first_response),
+            forward_bidirectional(
+                client_reader,
+                client_writer,
+                backend_reader,
+                backend_writer,
+                response_tracker,
             ),
             timeout=response_timeout,
         )
     except asyncio.TimeoutError:
-        logger.error("connection timed out client=%s backend=%s", client, getattr(backend, "name", None))
+        logger.error(
+            "proxy connection timed out client=%s backend=%s",
+            client,
+            getattr(backend, "name", None),
+        )
     except (ConnectionError, OSError, asyncio.IncompleteReadError) as exc:
         logger.error(
             "proxy connection failed client=%s backend=%s error=%s",
@@ -216,10 +374,11 @@ async def handle_client(client_reader, client_writer, pool, response_timeout):
     finally:
         await close_writer(backend_writer)
         await close_writer(client_writer)
-        if backend is not None:
-            if connected_at is not None and not response_recorded:
+        if reserved:
+            if response_tracker is not None and response_tracker.pending_requests:
                 logger.warning(
-                    "backend closed without response backend=%s client=%s",
+                    "backend closed with %s unanswered calls backend=%s client=%s",
+                    len(response_tracker.pending_requests),
                     backend.name,
                     client,
                 )
@@ -248,7 +407,10 @@ async def main():
     )
     server = await asyncio.start_server(
         lambda reader, writer: handle_client(
-            reader, writer, pool, response_timeout
+            reader,
+            writer,
+            pool,
+            response_timeout,
         ),
         host,
         port,

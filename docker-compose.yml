@@ -44,14 +44,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import rpyc; c=rpyc.connect('127.0.0.1',18861,config={'sync_request_timeout':2}); c.root.count_word('the','pride-and-prejudice.txt'); c.close()"]
-      interval: 10s
-      timeout: 4s
-      retries: 3
-      start_period: 5s
-    restart: unless-stopped
-
   server2:
     build: .
     environment:
@@ -64,14 +56,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import rpyc; c=rpyc.connect('127.0.0.1',18861,config={'sync_request_timeout':2}); c.root.count_word('the','pride-and-prejudice.txt'); c.close()"]
-      interval: 10s
-      timeout: 4s
-      retries: 3
-      start_period: 5s
-    restart: unless-stopped
-
   server3:
     build: .
     environment:
@@ -84,14 +68,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import rpyc; c=rpyc.connect('127.0.0.1',18861,config={'sync_request_timeout':2}); c.root.count_word('the','pride-and-prejudice.txt'); c.close()"]
-      interval: 10s
-      timeout: 4s
-      retries: 3
-      start_period: 5s
-    restart: unless-stopped
-
   load-balancer:
     build: .
     command: ["python", "/app/load_balancer/proxy.py"]
@@ -105,12 +81,11 @@ services:
       - "18860:18860"
     depends_on:
       server1:
-        condition: service_healthy
+        condition: service_started
       server2:
-        condition: service_healthy
+        condition: service_started
       server3:
-        condition: service_healthy
-    restart: unless-stopped
+        condition: service_started
 
   client:
     build: .

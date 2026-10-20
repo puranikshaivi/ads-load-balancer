@@ -51,6 +51,52 @@ def percentile(values, percentile_value):
     return ordered[index]
 
 
+def print_summary(summary):
+    elapsed_seconds = summary["elapsed_seconds"]
+    print("\nBenchmark summary")
+    print("=================")
+    print(f"Endpoint:                 {summary['endpoint']}")
+    print(
+        f"Requests / concurrency:   "
+        f"{summary['requests']} / {summary['concurrency']}"
+    )
+    print(
+        "Successful / failed:     "
+        f"{summary['successful_requests']} / "
+        f"{summary['failed_or_incorrect_requests']}"
+    )
+    print(f"Elapsed time:             {elapsed_seconds:.3f} s")
+    print(
+        f"Measured request rate:    "
+        f"{summary['requests_per_second']:.2f} req/s"
+    )
+    print(
+        f"Successful request rate:  "
+        f"{summary['successful_requests_per_second']:.2f} req/s"
+    )
+    print(
+        f"Mean / p99 latency:       "
+        f"{summary['average_latency_ms']:.2f} / "
+        f"{summary['p99_latency_ms']:.2f} ms"
+    )
+    print(
+        f"Cache hits / misses:      {summary['cache_hits']} / "
+        f"{summary['cache_misses']}"
+    )
+    print("Backend distribution:")
+    if summary["servers"]:
+        for server, count in sorted(summary["servers"].items()):
+            share = count / summary["successful_requests"] * 100
+            print(f"  {server:<22} {count:>6} requests ({share:5.1f}%)")
+    else:
+        print("  No successful requests")
+    print(f"Errors shown (max 10):    {len(summary['errors'])}")
+    for error in summary["errors"][:3]:
+        print(f"  - {error}")
+    if len(summary["errors"]) > 3:
+        print(f"  ... and {len(summary['errors']) - 3} more in the JSON summary")
+
+
 def send_request(endpoint, filename, keyword, expected_count, timeout):
     started = time.perf_counter()
     connection = None
@@ -162,6 +208,10 @@ def main():
         "p99_latency_ms": round(percentile(latencies, 0.99), 2),
         "elapsed_seconds": round(elapsed_seconds, 3),
         "requests_per_second": round(args.requests / elapsed_seconds, 2),
+        "successful_requests_per_second": round(
+            len(successful) / elapsed_seconds,
+            2,
+        ),
         "servers": dict(servers),
         "cache_hits": sum(result["cache_hit"] for result in successful),
         "cache_misses": sum(not result["cache_hit"] for result in successful),
@@ -171,8 +221,8 @@ def main():
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(summary, indent=2))
-    print(f"Full summary saved to {output_path}")
+    print_summary(summary)
+    print(f"\nFull JSON summary saved to {output_path}")
     return 0 if summary["failed_or_incorrect_requests"] == 0 else 1
 
 
