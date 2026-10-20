@@ -34,6 +34,7 @@ class Backend:
     active: int = 0
     estimated_response_ms: float = 1.0
     response_samples: int = 0
+    unavailable_until: float = 0.0
 
     @property
     def name(self):
@@ -41,7 +42,7 @@ class Backend:
 
 
 class BackendPool:
-    def __init__(self, backends, algorithm):
+    def __init__(self, backends, algorithm, failure_cooldown_seconds=10.0):
         algorithm = algorithm.strip().upper().replace("-", "_")
         if algorithm not in {"LEAST_CONNECTIONS", "LEAST_RESPONSE_TIME"}:
             raise ValueError(
@@ -55,10 +56,21 @@ class BackendPool:
         self.lock = asyncio.Lock()
         self.next_tie_break = 0
         self.ema_alpha = 0.2
+        self.failure_cooldown_seconds = failure_cooldown_seconds
 
-    async def select(self):
+    async def select(self, excluded=()):
         """Choose and reserve the least-loaded backend for the selected policy."""
         async with self.lock:
+            now = time.monotonic()
+            candidates = [
+                backend
+                for backend in self.backends
+                if backend.name not in excluded
+                and backend.unavailable_until <= now
+            ]
+            if not candidates:
+                raise ConnectionError("No healthy backends available")
+
             start = self.next_tie_break % len(self.backends)
 
             def score(backend):
@@ -66,21 +78,24 @@ class BackendPool:
                     return backend.active
                 return backend.estimated_response_ms * (backend.active + 1)
 
-            scores = [score(backend) for backend in self.backends]
+            scores = [score(backend) for backend in candidates]
             lowest_score = min(scores)
             tied = [
-                index
-                for index, backend_score in enumerate(scores)
+                backend
+                for backend, backend_score in zip(candidates, scores)
                 if backend_score == lowest_score
             ]
-            selected_index = min(
+            selected = min(
                 tied,
-                key=lambda index: (index - start) % len(self.backends),
+                key=lambda backend: (
+                    self.backends.index(backend) - start
+                ) % len(self.backends),
             )
-            selected = self.backends[selected_index]
 
             selected.active += 1
-            self.next_tie_break = (selected_index + 1) % len(self.backends)
+            self.next_tie_break = (self.backends.index(selected) + 1) % len(
+                self.backends
+            )
 
             logger.info(
                 "selected backend=%s algorithm=%s active=%s estimates_ms=%s",
@@ -97,7 +112,9 @@ class BackendPool:
                 time.monotonic() + self.failure_cooldown_seconds
             )
             logger.warning(
-                "backend marked unavailable backend=%s cooldown=%.1fs", backend.name, self.failure_cooldown_seconds
+                "backend marked unavailable backend=%s cooldown=%.1fs",
+                backend.name,
+                self.failure_cooldown_seconds,
             )
 
     async def mark_available(self, backend):
@@ -357,7 +374,13 @@ async def close_writer(writer):
         pass
 
 
-async def handle_client(client_reader, client_writer, pool, response_timeout):
+async def handle_client(
+    client_reader,
+    client_writer,
+    pool,
+    response_timeout,
+    connect_timeout=2.0,
+):
     client = client_writer.get_extra_info("peername")
     backend = None
     backend_writer = None
@@ -365,19 +388,43 @@ async def handle_client(client_reader, client_writer, pool, response_timeout):
     reserved = False
 
     try:
-        backend = await pool.select()
-        reserved = True
-        try:
-            backend_reader, backend_writer = await asyncio.wait_for(
-                asyncio.open_connection(backend.host, backend.port),
-                timeout=response_timeout,
-            )
-        except (OSError, asyncio.TimeoutError) as exc:
+        excluded = set()
+        for _ in pool.backends:
+            try:
+                backend = await pool.select(excluded)
+            except ConnectionError as exc:
+                logger.error(
+                    "no healthy backend available client=%s error=%s",
+                    client,
+                    exc,
+                )
+                return
+            reserved = True
+            try:
+                backend_reader, backend_writer = await asyncio.wait_for(
+                    asyncio.open_connection(backend.host, backend.port),
+                    timeout=connect_timeout,
+                )
+                break
+            except (OSError, asyncio.TimeoutError) as exc:
+                logger.error(
+                    "backend connection failed backend=%s client=%s error=%s",
+                    backend.name,
+                    client,
+                    exc,
+                )
+                await pool.mark_unavailable(backend)
+                await pool.release(backend)
+                reserved = False
+                excluded.add(backend.name)
+                logger.info(
+                    "retrying client=%s with another backend after failure=%s",
+                    client,
+                    backend.name,
+                )
+        else:
             logger.error(
-                "backend connection failed backend=%s client=%s error=%s",
-                backend.name,
-                client,
-                exc,
+                "all backend connection attempts failed client=%s", client
             )
             return
 
@@ -435,11 +482,26 @@ async def main():
             "server1:18861,server2:18861,server3:18861",
         )
     )
-    pool = BackendPool(backends, algorithm)
     host = os.getenv("LB_HOST", "0.0.0.0")
     port = int(os.getenv("LB_PORT", "18860"))
     response_timeout = float(os.getenv("LB_RESPONSE_TIMEOUT", "60"))
+    connect_timeout = float(os.getenv("LB_CONNECT_TIMEOUT", "2"))
     health_check_interval = float(os.getenv("LB_HEALTH_CHECK_INTERVAL", "3"))
+    failure_cooldown_seconds = float(
+        os.getenv("LB_FAILURE_COOLDOWN_SECONDS", "10")
+    )
+    if (
+        response_timeout <= 0
+        or connect_timeout <= 0
+        or health_check_interval <= 0
+        or failure_cooldown_seconds <= 0
+    ):
+        raise ValueError(
+            "LB_RESPONSE_TIMEOUT, LB_CONNECT_TIMEOUT, "
+            "LB_HEALTH_CHECK_INTERVAL, and LB_FAILURE_COOLDOWN_SECONDS "
+            "must be positive"
+        )
+    pool = BackendPool(backends, algorithm, failure_cooldown_seconds)
 
     logger.info(
         "starting TCP proxy algorithm=%s listen=%s:%s backends=%s",
@@ -454,6 +516,7 @@ async def main():
             writer,
             pool,
             response_timeout,
+            connect_timeout,
         ),
         host,
         port,

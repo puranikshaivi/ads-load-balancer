@@ -3,6 +3,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: ads-redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
     healthcheck:
@@ -44,6 +45,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    restart: unless-stopped
+
   server2:
     build: .
     environment:
@@ -56,6 +59,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    restart: unless-stopped
   server3:
     build: .
     environment:
@@ -68,6 +72,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    restart: unless-stopped
   load-balancer:
     build: .
     command: ["python", "/app/load_balancer/proxy.py"]
@@ -77,6 +82,9 @@ services:
       LB_HOST: 0.0.0.0
       LB_PORT: 18860
       LB_RESPONSE_TIMEOUT: 60
+      LB_CONNECT_TIMEOUT: ${LB_CONNECT_TIMEOUT:-2}
+      LB_HEALTH_CHECK_INTERVAL: ${LB_HEALTH_CHECK_INTERVAL:-3}
+      LB_FAILURE_COOLDOWN_SECONDS: ${LB_FAILURE_COOLDOWN_SECONDS:-10}
     ports:
       - "18860:18860"
     depends_on:
@@ -86,6 +94,7 @@ services:
         condition: service_started
       server3:
         condition: service_started
+    restart: unless-stopped
 
   client:
     build: .
